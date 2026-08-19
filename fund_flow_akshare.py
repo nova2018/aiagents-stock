@@ -152,6 +152,14 @@ class FundFlowAkshareDataFetcher:
                                 'sell_lg_amount': '大单卖出', 'buy_elg_amount': '超大单买入',
                                 'sell_elg_amount': '超大单卖出', 'net_mf_amount': '净额'
                             })
+
+                            # 新增五列净流入
+                            df['超大单净流入-净额'] = df['超大单买入'] - df['超大单卖出']
+                            df['大单净流入-净额']   = df['大单买入']   - df['大单卖出']
+                            df['中单净流入-净额']   = df['中单买入']   - df['中单卖出']
+                            df['小单净流入-净额']   = df['小单买入']   - df['小单卖出']
+                            df['主力净流入-净额']   = df['超大单净流入-净额'] + df['大单净流入-净额']
+                            
                             df = df.head(self.days)
                             print(f"   [Tushare] 成功获取 {len(df)} 条资金流向数据")
                         else:
