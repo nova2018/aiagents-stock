@@ -23,6 +23,9 @@ from longhubang_ui import display_longhubang
 from smart_monitor_ui import smart_monitor_ui
 from news_flow_ui import display_news_flow_monitor
 
+# 关闭优化，以解决字符串\uxxxx问题
+pd.options.future.infer_string = False
+
 # 页面配置
 st.set_page_config(
     page_title="复合多AI智能体股票团队分析系统",

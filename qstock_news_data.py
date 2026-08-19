@@ -173,7 +173,7 @@ class QStockNewsDataFetcher:
             if not news_items or len(news_items) < 5:
                 try:
                     # stock_news_cls() - 财联社电报
-                    df = ak.stock_news_cls()
+                    df = ak.stock_info_global_cls(symbol="全部")
                     
                     if df is not None and not df.empty:
                         # 筛选包含股票代码或名称的新闻
