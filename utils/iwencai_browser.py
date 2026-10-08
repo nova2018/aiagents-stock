@@ -22,35 +22,53 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import os
+from pathlib import Path
+
 # 缓存浏览器 cookies（每次有效期为5分钟）
 _cookie_cache = None
 _cookie_time = 0
-_COOKIE_TTL = 300  # 5秒后重新获取
+_COOKIE_TTL = 300  # 缓存时间（秒）
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+COOKIE_FILE = PROJECT_ROOT / ".iwencai_cookie.txt"
+PROFILE_DIR = PROJECT_ROOT / ".iwencai_profile"
 
 
 def get_browser_cookies(force_refresh=False):
     """
-    通过 Playwright 无头浏览器获取 iwencai 的有效 cookies。
+    获取 iwencai 的有效 cookies。
     
-    适用于 pywencai 因 TLS 指纹问题被 iwencai 服务器要求验证码的场景。
-    浏览器环境提供真实的 TLS 握手和 JavaScript 执行环境。
-    
-    Args:
-        force_refresh: 是否强制刷新（忽略缓存）
-    
-    Returns:
-        str: cookie 字符串，可用于 pywencai.get(cookie=...)
-              失败时返回空字符串。
+    优先级：
+    1. 环境变量 IWENCAI_COOKIE
+    2. 本地缓存文件 .iwencai_cookie.txt
+    3. 内存缓存（5分钟有效）
+    4. Playwright 持久化浏览器会话 (.iwencai_profile)
     """
     global _cookie_cache, _cookie_time
-    
-    # 如果缓存还在有效期内，直接返回
+
+    # 1. 优先读取环境变量
+    env_cookie = os.getenv("IWENCAI_COOKIE", "").strip()
+    if env_cookie:
+        return env_cookie
+
+    # 2. 读取本地 Cookie 保存文件
+    if not force_refresh and COOKIE_FILE.exists():
+        try:
+            saved_cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
+            if saved_cookie and len(saved_cookie) > 20:
+                _cookie_cache = saved_cookie
+                _cookie_time = time.time()
+                return saved_cookie
+        except Exception:
+            pass
+
+    # 3. 如果内存缓存还在有效期内，直接返回
     now = time.time()
     if not force_refresh and _cookie_cache and (now - _cookie_time) < _COOKIE_TTL:
         return _cookie_cache
     
     print(f"[iwencai] 🚀 启动浏览器获取会话...")
-    print(f"[iwencai] 💡 如果获取失败，请确保在浏览器中登录了 https://www.iwencai.com")
     
     try:
         from playwright.sync_api import sync_playwright
@@ -60,8 +78,11 @@ def get_browser_cookies(force_refresh=False):
     
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
+            # 使用持久化上下文保存登录状态
+            PROFILE_DIR.mkdir(exist_ok=True)
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=True,
                 viewport={'width': 1280, 'height': 800},
                 user_agent=(
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -71,30 +92,136 @@ def get_browser_cookies(force_refresh=False):
             )
             page = context.new_page()
             
-            # 访问 iwencai 主站，触发 cookie 设置
-            page.goto('https://www.iwencai.com/', wait_until='load', timeout=30000)
+            # 访问问财选股页面触发 cookie 设置
+            page.goto('https://www.iwencai.com/screener', wait_until='load', timeout=30000)
             time.sleep(2)  # 等待 JS 设置 cookie
             
-            # 获取所有 cookies，拼接成字符串
+            # 获取所有 cookies
             cookies = context.cookies()
             cookie_str = '; '.join(
                 f'{c["name"]}={c["value"]}'
                 for c in cookies
             )
             
-            browser.close()
+            context.close()
             
             if cookie_str:
                 _cookie_cache = cookie_str
                 _cookie_time = time.time()
+                # 仅在获取到的 cookie 包含有效登录或未保存过时写入
+                if not COOKIE_FILE.exists() or any(k in cookie_str for k in ['ticket', 'user=', 'escapename']):
+                    try:
+                        COOKIE_FILE.write_text(cookie_str, encoding="utf-8")
+                    except Exception:
+                        pass
                 print(f"[iwencai] ✅ 成功获取浏览器会话")
                 return cookie_str
             else:
                 print(f"[iwencai] ⚠️ 浏览器未返回任何 cookies")
-                print(f"[iwencai] 💡 请用浏览器打开 https://www.iwencai.com 并确保已登录")
                 return ""
             
     except Exception as e:
         print(f"[iwencai] ❌ 获取浏览器会话失败: {e}")
-        print(f"[iwencai] 💡 请尝试手动打开 https://www.iwencai.com/screener 并登录")
         return ""
+
+
+def query_wencai_browser(query: str, timeout_ms: int = 15000):
+    """
+    通过 Chromium 浏览器引擎直接向同花顺问财实时选股接口查询，
+    解析返回的数据流并转换成 pandas DataFrame。
+    绕过旧版 pywencai 的 403 屏蔽与老旧 API 弃用问题。
+    """
+    import urllib.parse
+    import json
+    import pandas as pd
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("未安装 playwright，无法使用浏览器选股")
+        return None
+
+    raw_cookies = get_browser_cookies()
+    cookies_to_add = []
+    if raw_cookies:
+        for item in raw_cookies.split(';'):
+            if '=' in item:
+                name, val = item.strip().split('=', 1)
+                for dom in ['.iwencai.com', '.10jqka.com.cn']:
+                    cookies_to_add.append({
+                        'name': name.strip(),
+                        'value': val.strip(),
+                        'domain': dom,
+                        'path': '/'
+                    })
+
+    encoded_query = urllib.parse.quote(query)
+    target_url = f"https://www.iwencai.com/screener/result?w={encoded_query}&querytype=stock"
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
+            )
+            context = browser.new_context(
+                user_agent=(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+            )
+            context.add_init_script(
+                "delete Object.getPrototypeOf(navigator).webdriver;\n"
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            if cookies_to_add:
+                context.add_cookies(cookies_to_add)
+
+            page = context.new_page()
+
+            datas_result = []
+
+            def on_response(res):
+                if 'stream-query' in res.url:
+                    try:
+                        body = res.text()
+                        for line in body.split('\n'):
+                            if line.startswith('data:'):
+                                d = json.loads(line[5:])
+                                if d.get('answer_path') == 'other/openAnswer':
+                                    comps = d.get('section', {}).get('result_page', {}).get('components', [])
+                                    for comp in comps:
+                                        datas = comp.get('data', {}).get('datas', [])
+                                        if datas:
+                                            datas_result.extend(datas)
+                    except Exception:
+                        pass
+
+            page.on('response', on_response)
+
+            try:
+                page.goto(target_url, wait_until='domcontentloaded', timeout=timeout_ms)
+                # 动态等待数据流返回（最多等待 8 秒，一旦获取到数据立刻返回）
+                start_w = time.time()
+                while time.time() - start_w < 8:
+                    if datas_result:
+                        break
+                    page.wait_for_timeout(300)
+            except Exception as e:
+                logger.debug(f"页面加载超时或等待中止: {e}")
+
+            browser.close()
+
+            if datas_result:
+                df = pd.DataFrame(datas_result)
+                print(f"[iwencai-browser] ✅ 成功获取到 {len(df)} 只股票数据")
+                return df
+            else:
+                logger.warning(f"[iwencai-browser] 查询未能返回股票列表（可能为付费受限或无匹配结果）")
+                return None
+
+    except Exception as e:
+        print(f"[iwencai-browser] ❌ 浏览器选股执行异常: {e}")
+        return None
+
